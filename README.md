@@ -1,3 +1,5 @@
+<img src="https://github.com/user-attachments/assets/2ff16776-3858-49b6-80f6-742b303453df" alt="Py-Cutter_Logo" width="25%" />
+
 # py-cutter
 
 A simple and efficient tool to cut audio and video files using timestamps from a CSV or Excel file.
