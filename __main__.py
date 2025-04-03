@@ -3,18 +3,21 @@ py-cutter
 
 This script processes a CSV or Excel file with video/audio files and cuts them
 according to specified start and end times. It supports custom output labeling.
+It can also optionally transcribe the output files using OpenAI's Whisper model.
 
 Input file must have the following columns:
 - original_filepath: Path to the source file
 - cut_start_time: Start time in HH:MM:SS format
 - cut_stop_time: Stop time in HH:MM:SS format
 - cut_label: Label to add to the end of the output filename
+- language: Language of the audio (optional, defaults to English)
 
 The script will:
 1. Validate input data
 2. Cut files according to specified times
 3. Save cut files to specified output directory or original location
 4. Add _copy-# suffix if a file already exists at the target location
+5. Optionally transcribe the cut files using Whisper (when --transcribe flag is used)
 """
 
 import os
@@ -29,6 +32,9 @@ import mimetypes
 import logging
 from datetime import datetime
 import argparse
+import importlib
+import pkg_resources
+from packaging import version
 
 # Set up logging
 def setup_logging():
@@ -341,6 +347,7 @@ def cut_media_file(source_path: Path, target_path: Path, start_time: str, end_ti
         if target_path.exists():
             # Generate a new filename with a copy tag
             target_path = get_next_available_filename(target_path)
+            logging.warning(f"Target file already exists, using: {target_path.name}")
         
         # Rename the temporary file to the target path
         os.rename(temp_output, target_path)
@@ -374,6 +381,12 @@ def validate_input_data(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     if missing_columns:
         errors.append(f"Missing required columns: {', '.join(missing_columns)}")
         return False, errors
+        
+    # Add 'language' column if it doesn't exist
+    if 'language' not in df.columns:
+        default_language = args.default_language if 'args' in locals() else 'en'
+        logging.info(f"'language' column not found in input file, adding with default value ({default_language})")
+        df['language'] = default_language
     
     # Check for missing values
     for col in required_columns:
@@ -456,13 +469,153 @@ def check_for_duplicate_outputs(df: pd.DataFrame, output_dir: Optional[Path] = N
     
     return len(duplicate_paths) > 0, duplicate_paths
 
-def process_row(row: Dict[str, Any], output_dir: Optional[Path] = None) -> Dict[str, Any]:
+# New function to check and install Whisper
+def check_and_install_whisper() -> Tuple[bool, str]:
+    """
+    Check if OpenAI Whisper is installed, and install it if it's not.
+    
+    Returns:
+        Tuple of (success, version or error message)
+    """
+    try:
+        # Check if whisper is already installed
+        try:
+            import openai_whisper
+            whisper_installed = True
+            whisper_module = openai_whisper
+        except ImportError:
+            try:
+                import whisper
+                whisper_installed = True
+                whisper_module = whisper
+            except ImportError:
+                whisper_installed = False
+                whisper_module = None
+        
+        if whisper_installed:
+            # Get the version
+            try:
+                whisper_version = whisper_module.__version__
+                logging.info(f"Whisper already installed (version {whisper_version})")
+                return True, whisper_version
+            except AttributeError:
+                logging.info("Whisper already installed (version unknown)")
+                return True, "unknown"
+        
+        # Install whisper if not installed
+        logging.info("Installing OpenAI Whisper...")
+        print("Installing OpenAI Whisper... This might take a few minutes.")
+        
+        # Install whisper using pip
+        install_command = [
+            sys.executable, 
+            "-m", 
+            "pip", 
+            "install", 
+            "--upgrade", 
+            "openai-whisper"
+        ]
+        
+        result = subprocess.run(
+            install_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            logging.error(f"Failed to install Whisper: {result.stderr}")
+            return False, f"Installation failed: {result.stderr}"
+        
+        # Verify the installation
+        try:
+            # Try to reload the module
+            if "whisper" in sys.modules:
+                importlib.reload(sys.modules["whisper"])
+            else:
+                import whisper
+            
+            # Get the version
+            try:
+                whisper_version = whisper.__version__
+                logging.info(f"Whisper installed successfully (version {whisper_version})")
+                return True, whisper_version
+            except AttributeError:
+                logging.info("Whisper installed successfully (version unknown)")
+                return True, "unknown"
+        except ImportError as e:
+            logging.error(f"Failed to import Whisper after installation: {str(e)}")
+            return False, f"Import error after installation: {str(e)}"
+        
+    except Exception as e:
+        logging.error(f"Error checking/installing Whisper: {str(e)}")
+        return False, f"Error: {str(e)}"
+
+# New function to transcribe audio file using Whisper
+def transcribe_audio_file(audio_path: Path, whisper_version: str, language: str = None) -> Tuple[bool, str, str]:
+    """
+    Transcribe an audio file using Whisper.
+    
+    Args:
+        audio_path: Path to the audio file
+        whisper_version: Version of Whisper being used
+        language: Language of the audio (optional)
+        
+    Returns:
+        Tuple of (success, transcript text or error message, output path)
+    """
+    try:
+        logging.info(f"Transcribing: {audio_path}")
+        if language:
+            logging.info(f"Using language: {language}")
+        
+        # Import whisper
+        try:
+            import openai_whisper as whisper
+        except ImportError:
+            import whisper
+        
+        # Load the model
+        model = whisper.load_model("large-v3")
+        
+        # Generate transcript with the specified language if provided
+        transcribe_options = {}
+        if language and language.strip():
+            transcribe_options["language"] = language.strip().lower()
+            result = model.transcribe(str(audio_path), **transcribe_options)
+            language_suffix = f"-{language.strip().lower()}"
+        else:
+            result = model.transcribe(str(audio_path))
+            language_suffix = ""
+        
+        # Extract the transcript text
+        transcript = result["text"]
+        
+        # Create output filename with the whisper version and language
+        transcript_path = audio_path.with_name(f"{audio_path.stem}_transcript-whisper-large-v3{language_suffix}-{whisper_version}.txt")
+        
+        # Save the transcript
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        
+        logging.info(f"Transcription saved to: {transcript_path}")
+        
+        return True, transcript, str(transcript_path)
+    
+    except Exception as e:
+        error_msg = f"Error transcribing {audio_path}: {str(e)}"
+        logging.error(error_msg)
+        return False, error_msg, ""
+
+def process_row(row: Dict[str, Any], output_dir: Optional[Path] = None, whisper_version: str = "unknown", enable_transcription: bool = False) -> Dict[str, Any]:
     """
     Process a single row from the input file.
     
     Args:
         row: Dictionary representing a row from the input file
         output_dir: Optional output directory
+        whisper_version: Version of Whisper being used
+        enable_transcription: Whether transcription is enabled
         
     Returns:
         Updated row with results
@@ -471,6 +624,8 @@ def process_row(row: Dict[str, Any], output_dir: Optional[Path] = None) -> Dict[
     result['output_filepath'] = ""
     result['status'] = ""
     result['message'] = ""
+    result['transcript_filepath'] = ""
+    result['transcript_status'] = ""
     # Don't add WARNINGS here - we'll add it at the end based on status/message
     
     try:
@@ -480,6 +635,9 @@ def process_row(row: Dict[str, Any], output_dir: Optional[Path] = None) -> Dict[
         # Convert times to HH:MM:SS format
         start_time = parse_time(row['cut_start_time'])
         end_time = parse_time(row['cut_stop_time'])
+        
+        # Get language for transcription (default to English if not specified)
+        language = row.get('language', 'en')
         
         # Get output filepath
         output_path = get_output_filepath(source_path, row['cut_label'], output_dir)
@@ -497,13 +655,34 @@ def process_row(row: Dict[str, Any], output_dir: Optional[Path] = None) -> Dict[
             result['output_filepath'] = message
             result['status'] = "SUCCESS"
             result['message'] = f"File cut successfully"
+            
+            # If successful and transcription is enabled, transcribe the file
+            if enable_transcription:
+                output_file_path = Path(message)
+                suffix = output_file_path.suffix.lower()
+                
+                # Only transcribe audio or video files
+                if suffix in ['.mp3', '.wav', '.aac', '.ogg', '.flac', '.m4a', '.mp4', '.mov', '.avi', '.mkv']:
+                    trans_success, trans_message, trans_filepath = transcribe_audio_file(output_file_path, whisper_version, language)
+                    result['transcript_filepath'] = trans_filepath
+                    result['transcript_status'] = "SUCCESS" if trans_success else "FAILED"
+                    
+                    if not trans_success:
+                        logging.error(f"Transcription failed: {trans_message}")
+                else:
+                    result['transcript_status'] = "SKIPPED"
+                    logging.info(f"Skipped transcription for non-audio/video file: {output_file_path}")
+            else:
+                result['transcript_status'] = "DISABLED"
         else:
             result['status'] = "FAILED"
             result['message'] = message
+            result['transcript_status'] = "SKIPPED"
     
     except Exception as e:
         result['status'] = "ERROR"
         result['message'] = str(e)
+        result['transcript_status'] = "SKIPPED"
     
     return result
 
@@ -551,11 +730,13 @@ def main():
     Main function to process files based on the input file.
     """
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='Cut audio/video files based on input CSV or Excel file.')
+    parser = argparse.ArgumentParser(description='Cut audio/video files based on input CSV or Excel file and transcribe them using Whisper.')
     parser.add_argument('input_file', type=str, help='Input CSV or Excel file with cutting instructions')
     parser.add_argument('--output-dir', type=str, help='Output directory for cut files (optional)')
     parser.add_argument('--force', action='store_true', help='Force processing even if duplicate outputs detected')
     parser.add_argument('--save-log', action='store_true', help='Save results log file alongside the input file (default: off)')
+    parser.add_argument('--transcribe', action='store_true', help='Enable transcription of the cut files using Whisper (default: off)')
+    parser.add_argument('--default-language', type=str, default='en', help='Default language for transcription if not specified in the input file (default: en)')
     
     args = parser.parse_args()
     
@@ -569,6 +750,22 @@ def main():
         print("Please install FFmpeg and make sure it's available in your PATH")
         print("See the README.md for installation instructions")
         sys.exit(1)
+    
+    # Check and install Whisper if not installed and transcription is enabled
+    whisper_version = "unknown"
+    if args.transcribe:
+        whisper_success, whisper_version_or_error = check_and_install_whisper()
+        if not whisper_success:
+            print(f"Error: Failed to install or load Whisper: {whisper_version_or_error}")
+            print("You can still proceed with cutting files without transcription")
+            args.transcribe = False  # Disable transcription if Whisper installation failed
+            logging.warning("Transcription disabled due to Whisper installation failure")
+        else:
+            whisper_version = whisper_version_or_error
+            logging.info(f"Transcription enabled with Whisper version {whisper_version}")
+    else:
+        logging.info("Transcription not enabled (use --transcribe to enable)")
+
     
     try:
         # Verify input file exists
@@ -603,6 +800,12 @@ def main():
         
         # Validate input data
         is_valid, validation_errors = validate_input_data(df)
+        
+        # If we have a default language from args, apply it to any rows with empty language values
+        if 'language' in df.columns and args.default_language:
+            df.loc[df['language'].isna() | (df['language'] == ''), 'language'] = args.default_language
+            logging.info(f"Applied default language '{args.default_language}' to rows with empty language values")
+            
         if not is_valid:
             logging.error("Validation errors found:")
             for error in validation_errors:
@@ -637,14 +840,20 @@ def main():
         
         # Process each row
         results = []
-        for _, row in df.iterrows():
+        for idx, row in df.iterrows():
             logging.info(f"Processing: {row['original_filepath']}")
-            result = process_row(row.to_dict(), output_dir)
+            result = process_row(row.to_dict(), output_dir, whisper_version, args.transcribe)
             results.append(result)
             
             # Log result
             if result['status'] == "SUCCESS":
                 logging.info(f"Successfully cut: {result['output_filepath']}")
+                
+                # Log transcription result if applicable
+                if result['transcript_status'] == "SUCCESS":
+                    logging.info(f"Successfully transcribed to: {result['transcript_filepath']}")
+                elif result['transcript_status'] == "FAILED":
+                    logging.warning(f"Failed to transcribe: {row['original_filepath']}")
             else:
                 logging.warning(f"Failed to cut {row['original_filepath']}: {result['message']}")
         
@@ -654,12 +863,26 @@ def main():
         # Add WARNINGS column
         results_df['WARNINGS'] = ""
         for idx, row in results_df.iterrows():
+            warnings = []
             if row['status'] != "SUCCESS":
-                results_df.at[idx, 'WARNINGS'] = row['message']
+                warnings.append(row['message'])
+            if row['transcript_status'] == "FAILED":
+                warnings.append(f"Transcription failed")
+            
+            if warnings:
+                results_df.at[idx, 'WARNINGS'] = "; ".join(warnings)
         
         # Count successes and failures
-        successes = len([r for r in results if r['status'] == "SUCCESS"])
-        failures = len(results) - successes
+        cut_successes = len([r for r in results if r['status'] == "SUCCESS"])
+        cut_failures = len(results) - cut_successes
+        
+        # Only count transcription statuses if transcription was enabled
+        if args.transcribe:
+            trans_successes = len([r for r in results if r['transcript_status'] == "SUCCESS"])
+            trans_failures = len([r for r in results if r['transcript_status'] == "FAILED"])
+            trans_skipped = len([r for r in results if r['transcript_status'] == "SKIPPED"])
+        else:
+            trans_successes = trans_failures = trans_skipped = 0
         
         # Only save results log if --save-log is specified
         if args.save_log:
@@ -678,8 +901,19 @@ def main():
             print(f"Results saved to: {output_file}")
         
         print(f"\nProcessing complete! {len(results)} files processed:")
-        print(f"  - {successes} files successfully cut")
-        print(f"  - {failures} files failed")
+        print(f"  - {cut_successes} files successfully cut")
+        print(f"  - {cut_failures} files failed")
+        
+        if args.transcribe:
+            print(f"\nTranscription results:")
+            print(f"  - {trans_successes} files successfully transcribed")
+            print(f"  - {trans_failures} files failed transcription")
+            print(f"  - {trans_skipped} files skipped transcription")
+            
+            if trans_successes > 0:
+                print(f"\nTranscription model: Whisper large-v3 (version {whisper_version})")
+        else:
+            print(f"\nTranscription was not enabled. Use --transcribe to enable audio transcription.")
         
     except Exception as e:
         logging.error(f"Error processing files: {str(e)}")
